@@ -124,6 +124,10 @@ class Tracker:
 
         if athlete.image_url:
             image_path = await _download_image(athlete.image_url)
+            if not image_path:
+                logger.warning(
+                    f"Image download failed for {athlete.name} — will tweet text only."
+                )
         else:
             logger.debug(f"No image URL for {athlete.name} — tweeting text only.")
 
@@ -159,9 +163,9 @@ class Tracker:
             await self._tweet_athlete(athlete)
 
         logger.info("TEST_MODE: posting random removed-fighter tweet ...")
-        removed = await get_random_removed_athlete(db)
+        removed = await get_random_removed_athlete(db) or await get_random_athlete(db)
         if not removed:
-            logger.info("TEST_MODE: no removed athletes in DB yet — skipping removed test tweet.")
+            logger.info("TEST_MODE: no athletes in DB yet — skipping removed test tweet.")
         else:
             logger.info(f"TEST_MODE: tweeting random removed athlete → {removed}")
             await self._tweet_athlete(removed, removed=True)
