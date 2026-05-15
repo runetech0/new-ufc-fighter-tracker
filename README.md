@@ -12,14 +12,14 @@ Automatically tracks new and removed fighters on the [UFC athlete roster](https:
    - Athletes previously in the database but no longer on the roster → marked as removed and tweeted as **removed**.
 3. **Tweet formats** — both include the fighter's portrait image if available:
    ```
-   ✅ New Fighter Added!
+   ✅ Fighter Added:
    Jon Jones "Bones"
    Division: Heavyweight
    Record: 27-1-0
    🔗 https://www.ufc.com/athlete/jon-jones
    ```
    ```
-   ❌ Fighter Removed from Roster!
+   ❌ Fighter Removed:
    Jon Jones "Bones"
    Division: Heavyweight
    Record: 27-1-0

@@ -32,7 +32,7 @@ POLL_INTERVAL = 1200  # 20 minutes
 def _format_tweet(athlete: Athlete) -> str:
     nickname = f' "{athlete.nickname}"' if athlete.nickname else ""
     lines = [
-        "✅ New Fighter Added!",
+        "✅ Fighter Added:",
         f"{athlete.name}{nickname}",
     ]
     if athlete.weight_class:
@@ -48,7 +48,7 @@ def _format_tweet(athlete: Athlete) -> str:
 def _format_removed_tweet(athlete: Athlete) -> str:
     nickname = f' "{athlete.nickname}"' if athlete.nickname else ""
     lines = [
-        "❌ Fighter Removed from Roster!",
+        "❌ Fighter Removed:",
         f"{athlete.name}{nickname}",
     ]
     if athlete.weight_class:
