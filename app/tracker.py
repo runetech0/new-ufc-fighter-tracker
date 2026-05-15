@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import tempfile
 import time
 
@@ -22,13 +23,14 @@ POLL_INTERVAL = 1200  # 20 minutes
 def _format_tweet(athlete: Athlete) -> str:
     nickname = f' "{athlete.nickname}"' if athlete.nickname else ""
     lines = [
-        "🆕 New Fighter Added!",
+        "✅ New Fighter Added!",
         f"{athlete.name}{nickname}",
     ]
     if athlete.weight_class:
         lines.append(f"Division: {athlete.weight_class}")
     if athlete.record:
-        lines.append(f"Record: {athlete.record}")
+        record = re.sub(r"\s*\(W-L-D\)", "", athlete.record).strip()
+        lines.append(f"Record: {record}")
     if athlete.profile_url:
         lines.append(f"🔗 {athlete.profile_url}")
     return "\n".join(lines)

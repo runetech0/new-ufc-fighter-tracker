@@ -10,10 +10,10 @@ Automatically tracks new fighters added to the [UFC athlete roster](https://www.
 2. **Polling loop** — every 20 minutes, re-scrapes the full roster and compares it against the database. Any athlete not already stored is saved and a tweet is posted automatically.
 3. **Tweet format** — includes the fighter's portrait image if available:
    ```
-   🆕 New Fighter Added!
+   ✅ New Fighter Added!
    Jon Jones "Bones"
    Division: Heavyweight
-   Record: 27-1-0 (W-L-D)
+   Record: 27-1-0
    🔗 https://www.ufc.com/athlete/jon-jones
    ```
 4. **TEST_MODE** — when enabled in `config.toml`, a tweet is posted for a randomly selected fighter after every scan so you can verify the full pipeline without waiting for a genuinely new fighter to appear.
