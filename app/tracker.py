@@ -10,7 +10,16 @@ import httpx
 from app.logs_config import get_logger
 
 from .browser import UFCBrowser
-from .db import DB_PATH, get_athlete_count, get_random_athlete, init_db, save_athlete
+from .db import (
+    DB_PATH,
+    get_all_active_profile_urls,
+    get_athlete_count,
+    get_random_athlete,
+    get_random_removed_athlete,
+    init_db,
+    mark_athletes_removed,
+    save_athlete,
+)
 from .models import Athlete
 from .poster import TweetPoster
 from .scraper import Scraper
@@ -33,6 +42,20 @@ def _format_tweet(athlete: Athlete) -> str:
         lines.append(f"Record: {record}")
     if athlete.profile_url:
         lines.append(f"🔗 {athlete.profile_url}")
+    return "\n".join(lines)
+
+
+def _format_removed_tweet(athlete: Athlete) -> str:
+    nickname = f' "{athlete.nickname}"' if athlete.nickname else ""
+    lines = [
+        "❌ Fighter Removed from Roster!",
+        f"{athlete.name}{nickname}",
+    ]
+    if athlete.weight_class:
+        lines.append(f"Division: {athlete.weight_class}")
+    if athlete.record:
+        record = re.sub(r"\s*\(W-L-D\)", "", athlete.record).strip()
+        lines.append(f"Record: {record}")
     return "\n".join(lines)
 
 
@@ -89,9 +112,14 @@ class Tracker:
             self._poster_ready = False
             logger.info("Poster browser closed after tweeting session.")
 
-    async def _tweet_athlete(self, athlete: Athlete) -> None:
+    async def _tweet_athlete(
+        self,
+        athlete: Athlete,
+        *,
+        removed: bool = False,
+    ) -> None:
         """Download image (if available) and post tweet, then clean up temp file."""
-        text = _format_tweet(athlete)
+        text = _format_removed_tweet(athlete) if removed else _format_tweet(athlete)
         image_path: str | None = None
 
         if athlete.image_url:
@@ -122,13 +150,45 @@ class Tracker:
         logger.debug("Post lock released.")
 
     async def _post_test_tweet(self, db: aiosqlite.Connection) -> None:
-        logger.info("TEST_MODE: selecting random athlete to tweet ...")
+        logger.info("TEST_MODE: posting random new-fighter tweet ...")
         athlete = await get_random_athlete(db)
         if not athlete:
-            logger.warning("TEST_MODE: no athletes in DB yet — skipping test tweet.")
-            return
-        logger.info(f"TEST_MODE: tweeting random athlete → {athlete}")
-        await self._tweet_athlete(athlete)
+            logger.warning("TEST_MODE: no active athletes in DB — skipping test tweet.")
+        else:
+            logger.info(f"TEST_MODE: tweeting random athlete → {athlete}")
+            await self._tweet_athlete(athlete)
+
+        logger.info("TEST_MODE: posting random removed-fighter tweet ...")
+        removed = await get_random_removed_athlete(db)
+        if not removed:
+            logger.info("TEST_MODE: no removed athletes in DB yet — skipping removed test tweet.")
+        else:
+            logger.info(f"TEST_MODE: tweeting random removed athlete → {removed}")
+            await self._tweet_athlete(removed, removed=True)
+
+    async def _detect_and_handle_removed(
+        self,
+        db: aiosqlite.Connection,
+        seen_urls: set[str],
+        tweet: bool,
+    ) -> int:
+        """Compare seen URLs vs active DB URLs; mark missing ones as removed."""
+        active_urls = await get_all_active_profile_urls(db)
+        removed_urls = active_urls - seen_urls
+        if not removed_urls:
+            logger.info("No removed athletes detected.")
+            return 0
+
+        logger.info(f"{len(removed_urls)} athlete(s) appear to have been removed.")
+        removed_athletes = await mark_athletes_removed(db, removed_urls)
+
+        if tweet and self._poster and removed_athletes:
+            logger.info(f"Tweeting {len(removed_athletes)} removed athlete(s) ...")
+            for i, athlete in enumerate(removed_athletes, 1):
+                logger.info(f"Tweeting removed {i}/{len(removed_athletes)}: {athlete.name}")
+                await self._tweet_athlete(athlete, removed=True)
+
+        return len(removed_athletes)
 
     async def _scrape_and_save(
         self,
@@ -136,11 +196,14 @@ class Tracker:
         ajax_url: str,
         headers: dict[str, str],
         tweet_new: bool,
-    ) -> int:
+    ) -> tuple[int, set[str]]:
         logger.info(f"=== _scrape_and_save() start — tweet_new={tweet_new} ===")
         new_athletes: list[Athlete] = []
+        seen_urls: set[str] = set()
 
         async def on_athlete(athlete: Athlete) -> None:
+            if athlete.profile_url:
+                seen_urls.add(athlete.profile_url)
             is_new = await save_athlete(db, athlete)
             if is_new:
                 logger.info(f"New athlete saved: {athlete}")
@@ -168,21 +231,24 @@ class Tracker:
                 f"tweeting suppressed (first run)."
             )
 
-        return len(new_athletes)
+        return len(new_athletes), seen_urls
 
     async def _save_initial_batch(
         self,
         db: aiosqlite.Connection,
         initial_athletes: list[Athlete],
-    ) -> list[Athlete]:
+    ) -> tuple[list[Athlete], set[str]]:
         new: list[Athlete] = []
+        seen_urls: set[str] = set()
         for athlete in initial_athletes:
+            if athlete.profile_url:
+                seen_urls.add(athlete.profile_url)
             if await save_athlete(db, athlete):
                 new.append(athlete)
         logger.info(
             f"Initial DOM batch: {len(new)}/{len(initial_athletes)} new athlete(s)."
         )
-        return new
+        return new, seen_urls
 
     async def _poll(
         self,
@@ -194,14 +260,18 @@ class Tracker:
         t0 = time.monotonic()
 
         initial_athletes, ajax_url, headers = await self._browser.capture_session()
-        new_initial = await self._save_initial_batch(db, initial_athletes)
+        new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
 
-        new_count = await self._scrape_and_save(db, ajax_url, headers, tweet_new=True)
+        new_count, seen_scraped = await self._scrape_and_save(db, ajax_url, headers, tweet_new=True)
+        seen_all = seen_initial | seen_scraped
+
+        removed_count = await self._detect_and_handle_removed(db, seen_all, tweet=True)
 
         total_new = new_count + len(new_initial)
         elapsed = time.monotonic() - t0
         logger.info(
-            f"=== _poll() complete — {total_new} new athlete(s) in {elapsed:.1f}s ==="
+            f"=== _poll() complete — {total_new} new, {removed_count} removed "
+            f"in {elapsed:.1f}s ==="
         )
 
         if self._poster and new_initial:
@@ -209,6 +279,9 @@ class Tracker:
             for i, athlete in enumerate(new_initial, 1):
                 logger.info(f"Tweeting initial {i}/{len(new_initial)}: {athlete.name}")
                 await self._tweet_athlete(athlete)
+
+        if self._poster and (new_initial or removed_count) and not self._test_mode:
+            await self._close_poster()
 
         if self._test_mode and self._poster:
             await self._post_test_tweet(db)
@@ -231,19 +304,23 @@ class Tracker:
             logger.info("--- Phase 1: Capture browser session ---")
             initial_athletes, ajax_url, headers = await self._browser.capture_session()
 
-            new_initial = await self._save_initial_batch(db, initial_athletes)
+            new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
 
             logger.info("--- Phase 2: Full scrape ---")
-            await self._scrape_and_save(
+            new_count, seen_scraped = await self._scrape_and_save(
                 db, ajax_url, headers, tweet_new=not is_first_run
             )
+            seen_all = seen_initial | seen_scraped
 
-            if not is_first_run and self._poster and new_initial:
-                logger.info(
-                    f"Tweeting {len(new_initial)} new athlete(s) from initial DOM batch ..."
-                )
-                for athlete in new_initial:
-                    await self._tweet_athlete(athlete)
+            if not is_first_run:
+                await self._detect_and_handle_removed(db, seen_all, tweet=True)
+
+                if self._poster and new_initial:
+                    logger.info(
+                        f"Tweeting {len(new_initial)} new athlete(s) from initial DOM batch ..."
+                    )
+                    for athlete in new_initial:
+                        await self._tweet_athlete(athlete)
 
             if is_first_run:
                 logger.info("Initial cache complete.")

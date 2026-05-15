@@ -1,14 +1,16 @@
 # UFC Fighter Tracker
 
-Automatically tracks new fighters added to the [UFC athlete roster](https://www.ufc.com/athletes/all) and posts a tweet for each new addition.
+Automatically tracks new and removed fighters on the [UFC athlete roster](https://www.ufc.com/athletes/all) and posts a tweet for each change.
 
 ---
 
 ## How It Works
 
 1. **First run** — launches a browser, scrapes every athlete from the UFC website, and caches them all in a local SQLite database. No tweets are posted during this phase.
-2. **Polling loop** — every 20 minutes, re-scrapes the full roster and compares it against the database. Any athlete not already stored is saved and a tweet is posted automatically.
-3. **Tweet format** — includes the fighter's portrait image if available:
+2. **Polling loop** — every 20 minutes, re-scrapes the full roster and compares it against the database:
+   - Athletes not yet in the database → saved and tweeted as **new**.
+   - Athletes previously in the database but no longer on the roster → marked as removed and tweeted as **removed**.
+3. **Tweet formats** — both include the fighter's portrait image if available:
    ```
    ✅ New Fighter Added!
    Jon Jones "Bones"
@@ -16,7 +18,13 @@ Automatically tracks new fighters added to the [UFC athlete roster](https://www.
    Record: 27-1-0
    🔗 https://www.ufc.com/athlete/jon-jones
    ```
-4. **TEST_MODE** — when enabled in `config.toml`, a tweet is posted for a randomly selected fighter after every scan so you can verify the full pipeline without waiting for a genuinely new fighter to appear.
+   ```
+   ❌ Fighter Removed from Roster!
+   Jon Jones "Bones"
+   Division: Heavyweight
+   Record: 27-1-0
+   ```
+4. **TEST_MODE** — when enabled in `config.toml`, two test tweets are posted after every scan (one random active fighter, one random removed fighter) so you can verify the full pipeline without waiting for a genuine roster change.
 
 ---
 
@@ -25,18 +33,20 @@ Automatically tracks new fighters added to the [UFC athlete roster](https://www.
 ```
 main.py               — Entry point. Wires up browser, poster, and tracker.
 app/
-  browser.py          — Playwright browser that navigates UFC.com, captures
+  browser.py          — Patchright browser that navigates UFC.com, captures
                         the AJAX session (URL + headers), and extracts the
                         first server-rendered athlete batch.
   scraper.py          — Async HTTP scraper (httpx). Fetches all paginated
                         AJAX pages concurrently using 5 workers and a
                         shared page counter protected by asyncio.Lock.
   tracker.py          — Orchestrator. Manages the first-run cache, the
-                        polling loop, and coordinates saving + tweeting.
+                        polling loop, and coordinates saving, removal
+                        detection, and tweeting.
   poster.py           — Self-contained Patchright browser that logs into
                         X (Twitter) via auth_token cookie, posts tweets
                         with optional image, and closes itself after use.
-  db.py               — aiosqlite helpers (init, save, count, random athlete).
+  db.py               — aiosqlite helpers (init, save, count, removal,
+                        random athlete).
   models.py           — Athlete dataclass.
   config_reader.py    — Reads config.toml into typed dataclasses.
 ```
@@ -61,10 +71,9 @@ cd ufc-tracker
 uv sync
 ```
 
-### 2. Install Playwright browsers
+### 2. Install Patchright browser
 
 ```bash
-uv run playwright install chromium
 uv run patchright install chromium
 ```
 
@@ -74,13 +83,13 @@ Rename `sample-config.toml` to `config.toml` and fill in the values:
 
 ```toml
 [BROWSER]
-HEADLESS = true                 # Set to false to watch the UFC browser
+HEADLESS = true                 # Set to false to watch the UFC scraper browser
 PAGE_LOAD_TIMEOUT_SECONDS = 30
 
 [TWITTER]
 AUTH_TOKEN = "your_auth_token_here"   # X.com auth_token cookie value
 SCREENSHOTS_DIR = "screenshots"       # Folder for debug screenshots
-TEST_MODE = false                     # Set to true to tweet a random fighter after every scan
+TEST_MODE = false                     # Set to true to post test tweets after every scan
 ```
 
 #### Getting your `auth_token`
@@ -98,7 +107,7 @@ TEST_MODE = false                     # Set to true to tweet a random fighter af
 uv run main.py
 ```
 
-On the **first run**, the bot will silently cache all ~3 000+ UFC fighters and then enter the polling loop. On every subsequent poll it will only tweet fighters that were not previously in the database.
+On the **first run**, the bot will silently cache all ~3 000+ UFC fighters and then enter the polling loop. On every subsequent poll it will tweet any fighters that are new or have been removed since the last scan.
 
 ---
 
@@ -106,16 +115,17 @@ On the **first run**, the bot will silently cache all ~3 000+ UFC fighters and t
 
 Fighter data is stored in `athletes.db` (SQLite). Schema:
 
-| Column        | Type | Description                     |
-|---------------|------|---------------------------------|
-| `profile_url` | TEXT | Primary key — UFC profile URL   |
-| `name`        | TEXT | Fighter full name                |
-| `nickname`    | TEXT | Fight nickname (nullable)        |
-| `weight_class`| TEXT | Division (nullable)              |
-| `record`      | TEXT | W-L-D record string (nullable)   |
-| `image_url`   | TEXT | Fighter portrait image URL (nullable) |
+| Column        | Type    | Description                                      |
+|---------------|---------|--------------------------------------------------|
+| `profile_url` | TEXT    | Primary key — UFC profile URL                    |
+| `name`        | TEXT    | Fighter full name                                |
+| `nickname`    | TEXT    | Fight nickname (nullable)                        |
+| `weight_class`| TEXT    | Division (nullable)                              |
+| `record`      | TEXT    | W-L-D record string (nullable)                   |
+| `image_url`   | TEXT    | Fighter portrait image URL (nullable)            |
+| `is_active`   | INTEGER | `1` = on roster, `0` = removed from roster       |
 
-> **Note:** If you already have an `athletes.db` from a previous version, the bot will automatically add the `image_url` column on startup and backfill it during the next scrape.
+> **Note:** If you have an existing `athletes.db` from an older version, missing columns (`image_url`, `is_active`) are added automatically on startup and backfilled during the next scrape.
 
 ---
 
@@ -137,7 +147,6 @@ ufc-tracker/
 │   ├── browser.py
 │   ├── config_reader.py
 │   ├── db.py
-│   ├── gvs.py
 │   ├── logs_config.py
 │   ├── models.py
 │   ├── poster.py
