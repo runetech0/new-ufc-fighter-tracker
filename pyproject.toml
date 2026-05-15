@@ -1,0 +1,44 @@
+
+[project]
+name = "Basic-Template"
+version = "0.1.0"
+description = "Basic Template for the projects"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "colorama>=0.4.6",
+    "toml>=0.10.2",
+    "tomlkit>=0.13.3",
+    "types-colorama>=0.4.15.20250801",
+    "types-toml>=0.10.8.20240310",
+    "httpx>=0.25.0",
+    "aiosqlite>=0.22.1",
+    "beautifulsoup4>=4.14.3",
+    "patchright>=1.59.1",
+    "pyvirtualdisplay>=3.0",
+]
+
+
+
+[tool.bumpver]
+
+current_version = "0.1.0"
+version_pattern = "MAJOR.MINOR.PATCH"
+commit_message = "bump version {old_version} -> {new_version}"
+tag_message = "{new_version}"
+tag_scope = "default"
+pre_commit_hook = ""
+post_commit_hook = ""
+commit = true
+tag = true
+push = true
+
+[tool.bumpver.file_patterns]
+
+"pyproject.toml" = [
+    'current_version = "{version}"',
+    'version = "{version}"',
+]
+"app/_version.py" = [
+    "{version}",
+]
