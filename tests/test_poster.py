@@ -2,8 +2,7 @@ import asyncio
 
 from app.logs_config import get_logger
 from app.poster import TweetPoster
-
-from .config import AUTH_TOKEN
+from tests.config import AUTH_TOKEN
 
 logger = get_logger()
 
