@@ -16,7 +16,6 @@ logger = get_logger()
 
 async def main() -> None:
     browser = UFCBrowser(
-        headless=Config.BROWSER.HEADLESS,
         page_load_timeout_seconds=Config.BROWSER.PAGE_LOAD_TIMEOUT_SECONDS,
     )
 

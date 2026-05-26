@@ -20,15 +20,10 @@ BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
 
 
 class UFCBrowser:
-    def __init__(
-        self,
-        headless: bool = False,
-        page_load_timeout_seconds: int = 10,
-    ):
-        self.headless = headless
+    def __init__(self, page_load_timeout_seconds: int = 10) -> None:
         self._page_load_timeout_seconds = page_load_timeout_seconds
         self._page_url = "https://www.ufc.com/athletes/all"
-        logger.info(f"UFCBrowser init — headless={headless}")
+        logger.info("UFCBrowser init — scraper always runs headless")
 
     async def _block_resources(self, route: Route) -> None:
         if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
@@ -46,9 +41,7 @@ class UFCBrowser:
             logger.info(f"Initial DOM batch: {len(athletes)} athletes extracted.")
             return athletes
         except Exception as e:
-            logger.error(
-                f"Failed to extract initial athletes from DOM: {e}", exc_info=True
-            )
+            logger.error(f"Failed to extract initial athletes from DOM: {e}", exc_info=True)
             return []
 
     async def _capture_ajax_request(self) -> Request | None:
@@ -94,18 +87,21 @@ class UFCBrowser:
         return req
 
     async def capture_session(self) -> tuple[list[Athlete], str, dict[str, str]]:
-        """Launch a fresh browser, capture the AJAX session, return (initial_athletes, ajax_url, headers)."""
+        """Launch a fresh headless browser, capture the AJAX session,
+        return (initial_athletes, ajax_url, headers)."""
         logger.info("=== capture_session() start ===")
         async with async_playwright() as p:
-            logger.info(
-                f"Launching {'headless' if self.headless else 'headed'} browser ..."
-            )
+            logger.info("Launching headless browser ...")
             browser = await p.chromium.launch(
-                headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
             )
             ctx = await browser.new_context()
-            logger.info("Fresh browser context created (no persistent session).")
+            logger.info("Fresh headless browser context created.")
 
             page = await ctx.new_page()
             await page.route("**/*", self._block_resources)
