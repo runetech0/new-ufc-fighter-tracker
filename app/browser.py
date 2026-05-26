@@ -86,10 +86,7 @@ class UFCBrowser:
             logger.info(f"Captured AJAX URL: {req.url[:120]}...")
         return req
 
-    async def capture_session(self) -> tuple[list[Athlete], str, dict[str, str]]:
-        """Launch a fresh headless browser, capture the AJAX session,
-        return (initial_athletes, ajax_url, headers)."""
-        logger.info("=== capture_session() start ===")
+    async def _capture_session_once(self) -> tuple[list[Athlete], str, dict[str, str]]:
         async with async_playwright() as p:
             logger.info("Launching headless browser ...")
             browser = await p.chromium.launch(
@@ -147,6 +144,39 @@ class UFCBrowser:
 
             logger.info("Closing browser ...")
             await browser.close()
-            logger.info("=== capture_session() complete ===")
-
             return initial_athletes, ajax_url, headers
+
+    async def capture_session(self) -> tuple[list[Athlete], str, dict[str, str]]:
+        """Launch a fresh headless browser with automatic retry on failure.
+        Uses exponential backoff: 10s → 20s → 40s → 80s → 160s between attempts."""
+        MAX_RETRIES = 5
+        BASE_DELAY = 10
+
+        logger.info("=== capture_session() start ===")
+        last_error: Exception | None = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                result = await self._capture_session_once()
+                if attempt > 1:
+                    logger.info(f"capture_session() succeeded on attempt {attempt}.")
+                logger.info("=== capture_session() complete ===")
+                return result
+            except Exception as e:
+                last_error = e
+                if attempt == MAX_RETRIES:
+                    break
+                delay = BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    f"capture_session() attempt {attempt}/{MAX_RETRIES} failed: {e} — "
+                    f"retrying in {delay}s ..."
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            f"capture_session() failed after {MAX_RETRIES} attempts. Last error: {last_error}",
+            exc_info=True,
+        )
+        raise RuntimeError(
+            f"Browser failed to launch after {MAX_RETRIES} attempts."
+        ) from last_error
