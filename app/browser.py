@@ -66,8 +66,10 @@ class UFCBrowser:
 
         logger.info("Clicking 'Load More' to trigger AJAX request ...")
         try:
-            await load_more.scroll_into_view_if_needed()
-            await load_more.click()
+            await self.page.evaluate(
+                "document.querySelector('a.button[title=\"Load more items\"]').click()"
+            )
+            logger.info("'Load More' clicked via JS.")
         except Exception as e:
             logger.error(f"Failed to click 'Load More': {e}", exc_info=True)
             return None
