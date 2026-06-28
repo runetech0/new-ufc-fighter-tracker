@@ -13,6 +13,10 @@ logger = get_logger()
 
 UFC_BASE_URL = "https://www.ufc.com"
 _INFINITE_SCROLL_METHOD = "infiniteScrollInsertView"
+# Abort the scrape if this many individual page fetches fail.  Beyond this
+# threshold the seen-URL set would be too incomplete to trust for removal
+# detection, so there is no benefit in continuing.
+_MAX_PAGE_FAILURES = 20
 
 OnAthleteFn = Callable[[Athlete], Awaitable[None]]
 
@@ -99,10 +103,21 @@ class Scraper:
         self._lock = asyncio.Lock()
         self._done = False
         self._total = 0
+        # Set to True if any page fetch fails (network error, bad HTTP status,
+        # JSON parse error). Used by callers to decide whether to trust the
+        # seen-URL set for removal detection.
+        self._had_failures = False
+        # Running count of failed pages across all workers; protected by _lock.
+        self._failure_count = 0
 
         logger.info(
             f"Scraper init — start_page={self._page}, concurrency={concurrency}"
         )
+
+    @property
+    def had_failures(self) -> bool:
+        """True if at least one page could not be fetched successfully."""
+        return self._had_failures
 
     async def _next_page(self) -> int | None:
         async with self._lock:
@@ -113,33 +128,39 @@ class Scraper:
             return page
 
     async def _fetch_page(self, client: httpx.AsyncClient, page: int) -> list[Athlete]:
+        """Fetch one AJAX page and return its athletes.
+
+        Returns an empty list *only* when the page genuinely has no data
+        (i.e. end of pagination).  Raises on every other failure so the
+        worker can distinguish a real empty page from a broken one.
+        """
         url = _build_page_url(self._base_url, page)
         logger.debug(f"Fetching page {page}: {url[:80]}...")
-        try:
-            response = await client.get(url, headers=self._headers)
-        except httpx.RequestError as e:
-            logger.error(f"Page {page}: network error — {e}", exc_info=True)
-            return []
 
+        # Network / connection failure → raise so the worker records it
+        # as a failure rather than silently treating it as an empty page.
+        response = await client.get(url, headers=self._headers)
+
+        # HTTP error (4xx / 5xx) → raise
         if response.status_code != 200:
             logger.warning(
                 f"Page {page}: HTTP {response.status_code} — {response.text[:200]}"
             )
             response.raise_for_status()
 
+        # Malformed JSON → raise
         try:
             commands = response.json()
         except Exception as e:
-            logger.error(
-                f"Page {page}: failed to parse JSON — {e}. "
-                f"Response snippet: {response.text[:300]}",
-                exc_info=True,
-            )
-            return []
+            raise ValueError(
+                f"Page {page}: invalid JSON — {e}. "
+                f"Response snippet: {response.text[:300]}"
+            ) from e
 
         html = _extract_view_data(commands)
         if not html:
-            logger.debug(f"Page {page}: no '{_INFINITE_SCROLL_METHOD}' command in response.")
+            # No infiniteScrollInsertView command → genuine end of pagination.
+            logger.debug(f"Page {page}: no '{_INFINITE_SCROLL_METHOD}' command — end of pages.")
             return []
 
         athletes = _parse_athletes(BeautifulSoup(html, "html.parser"))
@@ -157,12 +178,34 @@ class Scraper:
             try:
                 athletes = await self._fetch_page(client, page)
             except Exception as e:
-                logger.error(f"Worker-{worker_id} page {page}: unhandled error — {e}", exc_info=True)
+                # Record the failure but do NOT stop the scrape — other pages
+                # may still succeed.  If failures accumulate past the threshold
+                # we abort to avoid spinning on a degraded server.
                 async with self._lock:
-                    self._done = True
-                return
+                    self._had_failures = True
+                    self._failure_count += 1
+                    failure_count = self._failure_count
+                    if failure_count > _MAX_PAGE_FAILURES:
+                        self._done = True
+
+                logger.error(
+                    f"Worker-{worker_id} page {page}: fetch failed "
+                    f"(total failures: {failure_count}) — {e}",
+                    exc_info=True,
+                )
+
+                if failure_count > _MAX_PAGE_FAILURES:
+                    logger.error(
+                        f"Worker-{worker_id}: failure threshold ({_MAX_PAGE_FAILURES}) "
+                        f"exceeded — aborting scrape."
+                    )
+                    return
+
+                # Skip this page and move to the next one.
+                continue
 
             if not athletes:
+                # Genuine end of pagination — signal all workers to stop.
                 logger.info(f"Worker-{worker_id} page {page}: empty — signalling done.")
                 async with self._lock:
                     self._done = True

@@ -176,15 +176,76 @@ class Tracker:
         seen_urls: set[str],
         tweet: bool,
     ) -> int:
-        """Compare seen URLs vs active DB URLs; mark missing ones as removed."""
+        """Compare seen URLs vs active DB URLs; mark missing ones as removed.
+
+        When potential removals are found a second full scrape is performed to
+        confirm them.  Only fighters absent from *both* scrapes are marked
+        removed, preventing false positives caused by transient request
+        failures in the first scrape.
+        """
         active_urls = await get_all_active_profile_urls(db)
-        removed_urls = active_urls - seen_urls
-        if not removed_urls:
+        candidate_urls = active_urls - seen_urls
+
+        if not candidate_urls:
             logger.info("No removed athletes detected.")
             return 0
 
-        logger.info(f"{len(removed_urls)} athlete(s) appear to have been removed.")
-        removed_athletes = await mark_athletes_removed(db, removed_urls)
+        logger.warning(
+            f"{len(candidate_urls)} potentially removed athlete(s) detected — "
+            f"running confirmation scrape before marking anyone as removed ..."
+        )
+
+        # --- Confirmation scrape ---
+        # Re-capture a fresh browser session and re-scrape the full roster.
+        # Only fighters absent from this second pass as well are truly removed.
+        try:
+            _, ajax_url_2, headers_2 = await self._browser.capture_session()
+            confirmation_urls: set[str] = set()
+
+            async def _collect_url(athlete: Athlete) -> None:
+                if athlete.profile_url:
+                    confirmation_urls.add(athlete.profile_url)
+
+            scraper2 = Scraper(ajax_url_2, headers_2)
+            await scraper2.run(_collect_url)
+
+            if scraper2.had_failures:
+                # Confirmation scrape itself was incomplete — cannot trust it.
+                logger.warning(
+                    "Confirmation scrape had request failures — "
+                    "skipping removal detection this cycle to avoid false positives."
+                )
+                return 0
+
+            false_positives = candidate_urls & confirmation_urls
+            confirmed_removed = candidate_urls - confirmation_urls
+
+            if false_positives:
+                logger.info(
+                    f"{len(false_positives)} athlete(s) were false positives "
+                    f"(present in confirmation scrape) — not marking as removed."
+                )
+
+            if not confirmed_removed:
+                logger.info("No confirmed removals after confirmation scrape.")
+                return 0
+
+            logger.info(
+                f"{len(confirmed_removed)} athlete(s) confirmed removed "
+                f"(absent from both scrapes)."
+            )
+
+        except Exception as e:
+            # If the confirmation scrape itself fails entirely, play it safe
+            # and skip removal detection for this cycle.
+            logger.error(
+                f"Confirmation scrape failed: {e} — "
+                f"skipping removal detection this cycle.",
+                exc_info=True,
+            )
+            return 0
+
+        removed_athletes = await mark_athletes_removed(db, confirmed_removed)
 
         if tweet and self._poster and removed_athletes:
             logger.info(f"Tweeting {len(removed_athletes)} removed athlete(s) ...")
@@ -200,27 +261,64 @@ class Tracker:
         ajax_url: str,
         headers: dict[str, str],
         tweet_new: bool,
+        max_retries: int = 3,
     ) -> tuple[int, set[str]]:
+        """Scrape all paginated pages and save new athletes.
+
+        If any page requests fail the entire scrape is retried (up to
+        *max_retries* times) with a freshly captured browser session, so that
+        the seen-URL set is complete before it is used for removal detection.
+        """
         logger.info(f"=== _scrape_and_save() start — tweet_new={tweet_new} ===")
-        new_athletes: list[Athlete] = []
-        seen_urls: set[str] = set()
 
-        async def on_athlete(athlete: Athlete) -> None:
-            if athlete.profile_url:
-                seen_urls.add(athlete.profile_url)
-            is_new = await save_athlete(db, athlete)
-            if is_new:
-                logger.info(f"New athlete saved: {athlete}")
-                new_athletes.append(athlete)
+        for attempt in range(1, max_retries + 1):
+            new_athletes: list[Athlete] = []
+            seen_urls: set[str] = set()
 
-        t0 = time.monotonic()
-        await Scraper(ajax_url, headers).run(on_athlete)
-        elapsed = time.monotonic() - t0
+            async def on_athlete(athlete: Athlete) -> None:
+                if athlete.profile_url:
+                    seen_urls.add(athlete.profile_url)
+                is_new = await save_athlete(db, athlete)
+                if is_new:
+                    logger.info(f"New athlete saved: {athlete}")
+                    new_athletes.append(athlete)
 
-        logger.info(
-            f"=== _scrape_and_save() complete — "
-            f"{len(new_athletes)} new athlete(s) in {elapsed:.1f}s ==="
-        )
+            t0 = time.monotonic()
+            scraper = Scraper(ajax_url, headers)
+            await scraper.run(on_athlete)
+            elapsed = time.monotonic() - t0
+
+            if scraper.had_failures and attempt < max_retries:
+                # Some pages were not fetched — the seen-URL set is incomplete
+                # and could produce false removal detections.  Re-capture a
+                # fresh session and retry the full scrape.
+                logger.warning(
+                    f"Scrape attempt {attempt}/{max_retries} had request failures "
+                    f"({len(seen_urls)} URLs seen so far) — re-capturing session "
+                    f"and retrying to ensure a complete dataset ..."
+                )
+                try:
+                    _, ajax_url, headers = await self._browser.capture_session()
+                except Exception as e:
+                    logger.error(
+                        f"Session re-capture for retry {attempt + 1} failed: {e}",
+                        exc_info=True,
+                    )
+                    # Keep existing ajax_url/headers and try again anyway.
+                continue
+
+            if scraper.had_failures:
+                logger.warning(
+                    f"Scrape still had failures after {max_retries} attempt(s) — "
+                    f"proceeding with partial data; removal detection will be "
+                    f"skipped this cycle."
+                )
+            else:
+                logger.info(
+                    f"=== _scrape_and_save() complete — "
+                    f"{len(new_athletes)} new athlete(s) in {elapsed:.1f}s ==="
+                )
+            break
 
         if tweet_new and self._poster and new_athletes:
             logger.info(f"Tweeting {len(new_athletes)} new athlete(s) ...")
@@ -235,7 +333,9 @@ class Tracker:
                 f"tweeting suppressed (first run)."
             )
 
-        return len(new_athletes), seen_urls
+        # Return whether the scrape was fully successful so callers can decide
+        # whether to trust the seen-URL set for removal detection.
+        return len(new_athletes), seen_urls, not scraper.had_failures
 
     async def _save_initial_batch(
         self,
@@ -266,10 +366,22 @@ class Tracker:
         initial_athletes, ajax_url, headers = await self._browser.capture_session()
         new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
 
-        new_count, seen_scraped = await self._scrape_and_save(db, ajax_url, headers, tweet_new=True)
+        new_count, seen_scraped, scrape_complete = await self._scrape_and_save(
+            db, ajax_url, headers, tweet_new=True
+        )
         seen_all = seen_initial | seen_scraped
 
-        removed_count = await self._detect_and_handle_removed(db, seen_all, tweet=True)
+        # Only run removal detection when the scrape was fully successful.
+        # A partial scrape would produce an incomplete seen-URL set and could
+        # falsely flag fighters as removed.
+        if scrape_complete:
+            removed_count = await self._detect_and_handle_removed(db, seen_all, tweet=True)
+        else:
+            logger.warning(
+                "Scrape was incomplete after all retries — "
+                "skipping removal detection this cycle."
+            )
+            removed_count = 0
 
         total_new = new_count + len(new_initial)
         elapsed = time.monotonic() - t0
@@ -311,13 +423,19 @@ class Tracker:
             new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
 
             logger.info("--- Phase 2: Full scrape ---")
-            new_count, seen_scraped = await self._scrape_and_save(
+            new_count, seen_scraped, scrape_complete = await self._scrape_and_save(
                 db, ajax_url, headers, tweet_new=not is_first_run
             )
             seen_all = seen_initial | seen_scraped
 
             if not is_first_run:
-                await self._detect_and_handle_removed(db, seen_all, tweet=True)
+                if scrape_complete:
+                    await self._detect_and_handle_removed(db, seen_all, tweet=True)
+                else:
+                    logger.warning(
+                        "Initial scrape was incomplete after all retries — "
+                        "skipping removal detection."
+                    )
 
                 if self._poster and new_initial:
                     logger.info(
