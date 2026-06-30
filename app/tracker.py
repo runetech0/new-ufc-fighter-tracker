@@ -262,18 +262,31 @@ class Tracker:
         headers: dict[str, str],
         tweet_new: bool,
         max_retries: int = 3,
-    ) -> tuple[int, set[str]]:
+    ) -> tuple[int, set[str], bool]:
         """Scrape all paginated pages and save new athletes.
 
         If any page requests fail the entire scrape is retried (up to
         *max_retries* times) with a freshly captured browser session, so that
         the seen-URL set is complete before it is used for removal detection.
+
+        Returns (new_count, seen_urls, scrape_complete).
+
+        new_athletes is intentionally declared outside the retry loop so that
+        athletes found new in an early attempt (already saved to DB) are not
+        silently dropped when a retry resets seen_urls — save_athlete uses
+        INSERT OR IGNORE so they would not appear as new a second time.
         """
         logger.info(f"=== _scrape_and_save() start — tweet_new={tweet_new} ===")
 
+        # Accumulate new athletes across all retry attempts.  seen_urls is
+        # reset per attempt so the final value reflects a single complete pass.
+        new_athletes: list[Athlete] = []
+        seen_urls: set[str] = set()
+        scraper: Scraper | None = None
+
         for attempt in range(1, max_retries + 1):
-            new_athletes: list[Athlete] = []
-            seen_urls: set[str] = set()
+            # Reset seen_urls for each attempt to get a fresh complete picture.
+            seen_urls = set()
 
             async def on_athlete(athlete: Athlete) -> None:
                 if athlete.profile_url:
@@ -294,8 +307,9 @@ class Tracker:
                 # fresh session and retry the full scrape.
                 logger.warning(
                     f"Scrape attempt {attempt}/{max_retries} had request failures "
-                    f"({len(seen_urls)} URLs seen so far) — re-capturing session "
-                    f"and retrying to ensure a complete dataset ..."
+                    f"({len(seen_urls)} URLs seen so far, "
+                    f"{len(new_athletes)} new athletes so far) — "
+                    f"re-capturing session and retrying ..."
                 )
                 try:
                     _, ajax_url, headers = await self._browser.capture_session()
@@ -310,8 +324,8 @@ class Tracker:
             if scraper.had_failures:
                 logger.warning(
                     f"Scrape still had failures after {max_retries} attempt(s) — "
-                    f"proceeding with partial data; removal detection will be "
-                    f"skipped this cycle."
+                    f"proceeding with partial data; confirmation scrape will guard "
+                    f"against false removal detections."
                 )
             else:
                 logger.info(
@@ -319,6 +333,8 @@ class Tracker:
                     f"{len(new_athletes)} new athlete(s) in {elapsed:.1f}s ==="
                 )
             break
+
+        scrape_complete = scraper is not None and not scraper.had_failures
 
         if tweet_new and self._poster and new_athletes:
             logger.info(f"Tweeting {len(new_athletes)} new athlete(s) ...")
@@ -333,9 +349,7 @@ class Tracker:
                 f"tweeting suppressed (first run)."
             )
 
-        # Return whether the scrape was fully successful so callers can decide
-        # whether to trust the seen-URL set for removal detection.
-        return len(new_athletes), seen_urls, not scraper.had_failures
+        return len(new_athletes), seen_urls, scrape_complete
 
     async def _save_initial_batch(
         self,
@@ -371,17 +385,15 @@ class Tracker:
         )
         seen_all = seen_initial | seen_scraped
 
-        # Only run removal detection when the scrape was fully successful.
-        # A partial scrape would produce an incomplete seen-URL set and could
-        # falsely flag fighters as removed.
-        if scrape_complete:
-            removed_count = await self._detect_and_handle_removed(db, seen_all, tweet=True)
-        else:
+        # Always run removal detection.  Any athletes missed in the first scrape
+        # due to transient page failures will be found in the confirmation scrape
+        # inside _detect_and_handle_removed and filtered out as false positives.
+        if not scrape_complete:
             logger.warning(
-                "Scrape was incomplete after all retries — "
-                "skipping removal detection this cycle."
+                "First scrape had failures — proceeding with removal detection; "
+                "the confirmation scrape will filter out false positives."
             )
-            removed_count = 0
+        removed_count = await self._detect_and_handle_removed(db, seen_all, tweet=True)
 
         total_new = new_count + len(new_initial)
         elapsed = time.monotonic() - t0
@@ -423,19 +435,21 @@ class Tracker:
             new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
 
             logger.info("--- Phase 2: Full scrape ---")
-            new_count, seen_scraped, scrape_complete = await self._scrape_and_save(
+            _, seen_scraped, scrape_complete = await self._scrape_and_save(
                 db, ajax_url, headers, tweet_new=not is_first_run
             )
             seen_all = seen_initial | seen_scraped
 
             if not is_first_run:
-                if scrape_complete:
-                    await self._detect_and_handle_removed(db, seen_all, tweet=True)
-                else:
+                # Always run removal detection regardless of scrape_complete.
+                # The confirmation scrape inside _detect_and_handle_removed is
+                # the safety net that filters out false positives from missed pages.
+                if not scrape_complete:
                     logger.warning(
-                        "Initial scrape was incomplete after all retries — "
-                        "skipping removal detection."
+                        "First scrape had failures — proceeding with removal detection; "
+                        "the confirmation scrape will filter out false positives."
                     )
+                await self._detect_and_handle_removed(db, seen_all, tweet=True)
 
                 if self._poster and new_initial:
                     logger.info(
