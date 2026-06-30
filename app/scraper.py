@@ -59,14 +59,16 @@ def _parse_athletes(soup: BeautifulSoup) -> list[Athlete]:
             raw_src = f"https://ufc.com{raw_src}"
         image_url = raw_src if isinstance(raw_src, str) else None
 
-        athletes.append(Athlete(
-            name=name,
-            nickname=nickname or None,
-            weight_class=weight_class,
-            record=record,
-            profile_url=profile_url,
-            image_url=image_url,
-        ))
+        athletes.append(
+            Athlete(
+                name=name,
+                nickname=nickname or None,
+                weight_class=weight_class,
+                record=record,
+                profile_url=profile_url,
+                image_url=image_url,
+            )
+        )
 
     return athletes
 
@@ -160,14 +162,18 @@ class Scraper:
         html = _extract_view_data(commands)
         if not html:
             # No infiniteScrollInsertView command → genuine end of pagination.
-            logger.debug(f"Page {page}: no '{_INFINITE_SCROLL_METHOD}' command — end of pages.")
+            logger.debug(
+                f"Page {page}: no '{_INFINITE_SCROLL_METHOD}' command — end of pages."
+            )
             return []
 
         athletes = _parse_athletes(BeautifulSoup(html, "html.parser"))
         logger.debug(f"Page {page}: parsed {len(athletes)} athlete cards.")
         return athletes
 
-    async def _worker(self, worker_id: int, client: httpx.AsyncClient, on_athlete: OnAthleteFn) -> None:
+    async def _worker(
+        self, worker_id: int, client: httpx.AsyncClient, on_athlete: OnAthleteFn
+    ) -> None:
         logger.debug(f"Worker-{worker_id} started.")
         while True:
             page = await self._next_page()
@@ -214,6 +220,7 @@ class Scraper:
             for athlete in athletes:
                 try:
                     await on_athlete(athlete)
+
                 except Exception as e:
                     logger.error(
                         f"Worker-{worker_id} page {page}: on_athlete callback failed for "
@@ -241,5 +248,7 @@ class Scraper:
             ]
             await asyncio.gather(*workers)
 
-        logger.info(f"=== Scraper.run() complete — total pages processed ~{self._page - 1}, athletes: {self._total} ===")
+        logger.info(
+            f"=== Scraper.run() complete — total pages processed ~{self._page - 1}, athletes: {self._total} ==="
+        )
         return self._total
