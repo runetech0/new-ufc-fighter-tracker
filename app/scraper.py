@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Any, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
@@ -17,6 +18,9 @@ _INFINITE_SCROLL_METHOD = "infiniteScrollInsertView"
 # threshold the seen-URL set would be too incomplete to trust for removal
 # detection, so there is no benefit in continuing.
 _MAX_PAGE_FAILURES = 20
+# Retry each page this many times before counting it as a failure.
+_PAGE_RETRY_ATTEMPTS = 3
+_PAGE_RETRY_BASE_DELAY = 2  # seconds; doubles each retry
 
 OnAthleteFn = Callable[[Athlete], Awaitable[None]]
 
@@ -73,13 +77,24 @@ def _parse_athletes(soup: BeautifulSoup) -> list[Athlete]:
     return athletes
 
 
-def _extract_view_data(commands: list[dict[str, object]]) -> str | None:
-    for cmd in commands:
+def _extract_view_data(raw_json: Any) -> str | None:
+    """Extract the HTML payload from the Drupal Views AJAX JSON response.
+
+    Accepts the raw parsed JSON value (any type) so the caller does not need
+    to pre-validate the structure.  Returns None if the expected command is
+    absent or the response shape is unexpected.
+    """
+    if not isinstance(raw_json, list):
+        return None
+    for item in raw_json:  # type: ignore[reportUnknownVariableType]
+        if not isinstance(item, dict):
+            continue
+        entry: dict[str, Any] = cast(dict[str, Any], item)
         if (
-            cmd.get("command") == "insert"
-            and cmd.get("method") == _INFINITE_SCROLL_METHOD
+            entry.get("command") == "insert"
+            and entry.get("method") == _INFINITE_SCROLL_METHOD
         ):
-            data = cmd.get("data", "")
+            data = entry.get("data", "")
             if isinstance(data, str) and data:
                 return data
     return None
@@ -132,44 +147,68 @@ class Scraper:
     async def _fetch_page(self, client: httpx.AsyncClient, page: int) -> list[Athlete]:
         """Fetch one AJAX page and return its athletes.
 
+        Retries up to _PAGE_RETRY_ATTEMPTS times with exponential backoff on
+        transient errors (5xx, network issues, malformed JSON) before raising.
+
         Returns an empty list *only* when the page genuinely has no data
         (i.e. end of pagination).  Raises on every other failure so the
-        worker can distinguish a real empty page from a broken one.
+        worker can count it as a failure.
         """
         url = _build_page_url(self._base_url, page)
         logger.debug(f"Fetching page {page}: {url[:80]}...")
 
-        # Network / connection failure → raise so the worker records it
-        # as a failure rather than silently treating it as an empty page.
-        response = await client.get(url, headers=self._headers)
+        last_exc: Exception | None = None
+        for attempt in range(1, _PAGE_RETRY_ATTEMPTS + 1):
+            try:
+                response = await client.get(url, headers=self._headers)
 
-        # HTTP error (4xx / 5xx) → raise
-        if response.status_code != 200:
-            logger.warning(
-                f"Page {page}: HTTP {response.status_code} — {response.text[:200]}"
-            )
-            response.raise_for_status()
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Page {page} (attempt {attempt}/{_PAGE_RETRY_ATTEMPTS}): "
+                        f"HTTP {response.status_code} — {response.text[:200]}"
+                    )
+                    response.raise_for_status()
 
-        # Malformed JSON → raise
-        try:
-            commands = response.json()
-        except Exception as e:
-            raise ValueError(
-                f"Page {page}: invalid JSON — {e}. "
-                f"Response snippet: {response.text[:300]}"
-            ) from e
+                try:
+                    raw_json: Any = response.json()
+                except Exception as e:
+                    raise ValueError(
+                        f"Page {page}: invalid JSON — {e}. "
+                        f"Response snippet: {response.text[:300]}"
+                    ) from e
 
-        html = _extract_view_data(commands)
-        if not html:
-            # No infiniteScrollInsertView command → genuine end of pagination.
-            logger.debug(
-                f"Page {page}: no '{_INFINITE_SCROLL_METHOD}' command — end of pages."
-            )
-            return []
+                html = _extract_view_data(raw_json)
+                if not html:
+                    # _extract_view_data returns None both for a non-list response
+                    # and for a list with no infiniteScrollInsertView command.
+                    # The latter means genuine end of pagination.
+                    if not isinstance(raw_json, list):
+                        raise ValueError(
+                            f"Page {page}: expected JSON array, got "
+                            f"{type(raw_json).__name__}. "
+                            f"Snippet: {str(raw_json)[:200]}"
+                        )
+                    logger.debug(
+                        f"Page {page}: no '{_INFINITE_SCROLL_METHOD}' command — "
+                        f"end of pages."
+                    )
+                    return []
 
-        athletes = _parse_athletes(BeautifulSoup(html, "html.parser"))
-        logger.debug(f"Page {page}: parsed {len(athletes)} athlete cards.")
-        return athletes
+                athletes = _parse_athletes(BeautifulSoup(html, "html.parser"))
+                logger.debug(f"Page {page}: parsed {len(athletes)} athlete cards.")
+                return athletes
+
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _PAGE_RETRY_ATTEMPTS:
+                    delay = _PAGE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Page {page}: attempt {attempt}/{_PAGE_RETRY_ATTEMPTS} "
+                        f"failed ({exc}) — retrying in {delay}s ..."
+                    )
+                    await asyncio.sleep(delay)
+
+        raise last_exc  # type: ignore[misc]
 
     async def _worker(
         self, worker_id: int, client: httpx.AsyncClient, on_athlete: OnAthleteFn
