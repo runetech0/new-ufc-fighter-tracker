@@ -80,23 +80,28 @@ def _parse_athletes(soup: BeautifulSoup) -> list[Athlete]:
 def _extract_view_data(raw_json: Any) -> str | None:
     """Extract the HTML payload from the Drupal Views AJAX JSON response.
 
-    Accepts the raw parsed JSON value (any type) so the caller does not need
-    to pre-validate the structure.  Returns None if the expected command is
-    absent or the response shape is unexpected.
+    The UFC API returns either a list of command objects or a dict keyed by
+    integer strings (e.g. {'1': {command...}, '2': {command...}}).  Both
+    formats are handled here.
     """
-    if not isinstance(raw_json, list):
+    def _search(items: Any) -> str | None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry: dict[str, Any] = cast(dict[str, Any], item)
+            if (
+                entry.get("command") == "insert"
+                and entry.get("method") == _INFINITE_SCROLL_METHOD
+            ):
+                data = entry.get("data", "")
+                if isinstance(data, str) and data:
+                    return data
         return None
-    for item in raw_json:  # type: ignore[reportUnknownVariableType]
-        if not isinstance(item, dict):
-            continue
-        entry: dict[str, Any] = cast(dict[str, Any], item)
-        if (
-            entry.get("command") == "insert"
-            and entry.get("method") == _INFINITE_SCROLL_METHOD
-        ):
-            data = entry.get("data", "")
-            if isinstance(data, str) and data:
-                return data
+
+    if isinstance(raw_json, dict):
+        return _search(raw_json.values())
+    if isinstance(raw_json, list):
+        return _search(raw_json)
     return None
 
 
@@ -179,12 +184,9 @@ class Scraper:
 
                 html = _extract_view_data(raw_json)
                 if not html:
-                    # _extract_view_data returns None both for a non-list response
-                    # and for a list with no infiniteScrollInsertView command.
-                    # The latter means genuine end of pagination.
-                    if not isinstance(raw_json, list):
+                    if not isinstance(raw_json, (list, dict)):
                         raise ValueError(
-                            f"Page {page}: expected JSON array, got "
+                            f"Page {page}: unexpected JSON type "
                             f"{type(raw_json).__name__}. "
                             f"Snippet: {str(raw_json)[:200]}"
                         )
