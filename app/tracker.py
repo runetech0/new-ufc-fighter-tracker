@@ -12,21 +12,23 @@ from app.logs_config import get_logger
 from .browser import UFCBrowser
 from .db import (
     DB_PATH,
-    get_all_active_profile_urls,
+    get_active_statuses,
     get_athlete_count,
     get_random_athlete,
     get_random_removed_athlete,
     init_db,
     mark_athletes_removed,
     save_athlete,
+    update_fighter_status,
 )
 from .models import Athlete
 from .poster import TweetPoster
 from .scraper import Scraper
+from .status_checker import STATUS_ACTIVE, STATUS_NOT_FIGHTING, fetch_statuses
 
 logger = get_logger()
 
-POLL_INTERVAL = 1200  # 20 minutes
+POLL_INTERVAL = 1800  # 30 minutes
 
 
 def _format_tweet(athlete: Athlete) -> str:
@@ -70,7 +72,9 @@ async def _download_image(url: str) -> str | None:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.write(response.content)
         tmp.close()
-        logger.info(f"Image downloaded to temp file: {tmp.name} ({len(response.content)} bytes)")
+        logger.info(
+            f"Image downloaded to temp file: {tmp.name} ({len(response.content)} bytes)"
+        )
         return tmp.name
     except Exception as e:
         logger.error(f"Failed to download image from {url}: {e}", exc_info=True)
@@ -146,7 +150,9 @@ class Tracker:
                 )
                 logger.info("Tweet posted successfully.")
             except Exception as e:
-                logger.error(f"_tweet_athlete() failed for {athlete.name}: {e}", exc_info=True)
+                logger.error(
+                    f"_tweet_athlete() failed for {athlete.name}: {e}", exc_info=True
+                )
             finally:
                 if image_path and os.path.exists(image_path):
                     os.remove(image_path)
@@ -165,127 +171,157 @@ class Tracker:
         logger.info("TEST_MODE: posting random removed-fighter tweet ...")
         removed = await get_random_removed_athlete(db) or await get_random_athlete(db)
         if not removed:
-            logger.info("TEST_MODE: no athletes in DB yet — skipping removed test tweet.")
+            logger.info(
+                "TEST_MODE: no athletes in DB yet — skipping removed test tweet."
+            )
         else:
             logger.info(f"TEST_MODE: tweeting random removed athlete → {removed}")
             await self._tweet_athlete(removed, removed=True)
 
-    async def _detect_and_handle_removed(
+    async def _detect_status_changes(
         self,
         db: aiosqlite.Connection,
-        seen_urls: set[str],
         tweet: bool,
     ) -> int:
-        """Compare seen URLs vs active DB URLs; mark missing ones as removed.
+        """Detect UFC roster changes by comparing live profile-page status against DB.
 
-        When potential removals are found a second full scrape is performed to
-        confirm them.  Only fighters absent from *both* scrapes are marked
-        removed, preventing false positives caused by transient request
-        failures in the first scrape.
+        Flow:
+        1. Load {profile_url: fighter_status} for every is_active=1 athlete from DB.
+        2. Fetch the live status badge from each fighter's UFC profile page.
+        3. For every URL that was successfully fetched, compare live vs DB status.
+           - DB='Active', live='Not Fighting'  → fighter was cut/released → mark removed + tweet.
+           - Status unchanged → no-op.
+           - Any other live status → update DB only.
+           - Failed fetches are skipped entirely to avoid false positives.
+
+        tweet=False on the very first run so we don't spam removals for fighters
+        who were already 'Not Fighting' before this bot was deployed.
         """
-        active_urls = await get_all_active_profile_urls(db)
-        candidate_urls = active_urls - seen_urls
-
-        if not candidate_urls:
-            logger.info("No removed athletes detected.")
+        db_statuses: dict[str, str] = await get_active_statuses(db)
+        if not db_statuses:
+            logger.info("Status change detection — no active athletes in DB.")
             return 0
 
-        logger.warning(
-            f"{len(candidate_urls)} potentially removed athlete(s) detected — "
-            f"running confirmation scrape before marking anyone as removed ..."
+        logger.info(
+            f"Status change detection — {len(db_statuses)} active athlete(s) in DB, "
+            f"fetching live profile statuses ..."
         )
 
-        # --- Confirmation scrape ---
-        # Re-capture a fresh browser session and re-scrape the full roster.
-        # Only fighters absent from this second pass as well are truly removed.
-        try:
-            _, ajax_url_2, headers_2 = await self._browser.capture_session()
-            confirmation_urls: set[str] = set()
+        live_statuses, had_failures = await fetch_statuses(set(db_statuses.keys()))
 
-            async def _collect_url(athlete: Athlete) -> None:
-                if athlete.profile_url:
-                    confirmation_urls.add(athlete.profile_url)
+        if had_failures:
+            logger.warning(
+                f"Status check had fetch failures — "
+                f"{len(live_statuses)}/{len(db_statuses)} profiles fetched successfully. "
+                f"Only comparing athletes with a successful fetch."
+            )
 
-            scraper2 = Scraper(ajax_url_2, headers_2)
-            await scraper2.run(_collect_url)
+        newly_removed: set[str] = set()
 
-            if scraper2.had_failures:
-                # Confirmation scrape itself was incomplete — cannot trust it.
-                logger.warning(
-                    "Confirmation scrape had request failures — "
-                    "skipping removal detection this cycle to avoid false positives."
-                )
-                return 0
+        for url, live_status in live_statuses.items():
+            db_status = db_statuses.get(url, STATUS_ACTIVE)
 
-            false_positives = candidate_urls & confirmation_urls
-            confirmed_removed = candidate_urls - confirmation_urls
-
-            if false_positives:
-                logger.info(
-                    f"{len(false_positives)} athlete(s) were false positives "
-                    f"(present in confirmation scrape) — not marking as removed."
-                )
-
-            if not confirmed_removed:
-                logger.info("No confirmed removals after confirmation scrape.")
-                return 0
+            if live_status == db_status:
+                continue
 
             logger.info(
-                f"{len(confirmed_removed)} athlete(s) confirmed removed "
-                f"(absent from both scrapes)."
+                f"Status changed: {url} — DB='{db_status}' → live='{live_status}'"
             )
 
-        except Exception as e:
-            # If the confirmation scrape itself fails entirely, play it safe
-            # and skip removal detection for this cycle.
-            logger.error(
-                f"Confirmation scrape failed: {e} — "
-                f"skipping removal detection this cycle.",
-                exc_info=True,
-            )
+            if live_status == STATUS_NOT_FIGHTING and db_status == STATUS_ACTIVE:
+                newly_removed.add(url)
+            else:
+                # Any other transition: just persist the new value.
+                await update_fighter_status(db, url, live_status)
+
+        if not newly_removed:
+            logger.info("Status change detection — no newly released fighters detected.")
             return 0
 
-        removed_athletes = await mark_athletes_removed(db, confirmed_removed)
+        logger.info(
+            f"{len(newly_removed)} fighter(s) newly changed to 'Not Fighting' — "
+            f"marking as removed ..."
+        )
+        removed_athletes = await mark_athletes_removed(db, newly_removed)
 
         if tweet and self._poster and removed_athletes:
-            logger.info(f"Tweeting {len(removed_athletes)} removed athlete(s) ...")
+            logger.info(
+                f"Tweeting {len(removed_athletes)} status-changed removed athlete(s) ..."
+            )
             for i, athlete in enumerate(removed_athletes, 1):
-                logger.info(f"Tweeting removed {i}/{len(removed_athletes)}: {athlete.name}")
+                logger.info(
+                    f"Tweeting status-removed {i}/{len(removed_athletes)}: {athlete.name}"
+                )
                 await self._tweet_athlete(athlete, removed=True)
 
         return len(removed_athletes)
+
+    async def _filter_active_new_athletes(
+        self,
+        db: aiosqlite.Connection,
+        new_athletes: list[Athlete],
+    ) -> list[Athlete]:
+        """Check new athletes' live profile status before tweeting them as 'added'.
+
+        Returns only those whose status is 'Active'.  Any that are already
+        'Not Fighting' are silently marked removed in the DB — they were cut
+        before this bot started tracking them and should not produce an 'Added'
+        tweet.  Fighters whose profile fetch failed are assumed active so we
+        don't silently drop genuine new signings.
+        """
+        if not new_athletes:
+            return []
+
+        urls = {a.profile_url for a in new_athletes if a.profile_url}
+        if not urls:
+            return new_athletes
+
+        live_statuses, _ = await fetch_statuses(urls)
+
+        active_athletes: list[Athlete] = []
+        already_cut: set[str] = set()
+
+        for athlete in new_athletes:
+            live = live_statuses.get(athlete.profile_url) if athlete.profile_url else None
+            if live == STATUS_NOT_FIGHTING:
+                logger.info(
+                    f"New athlete {athlete.name} is already 'Not Fighting' — "
+                    f"saving silently, no tweet."
+                )
+                if athlete.profile_url:
+                    already_cut.add(athlete.profile_url)
+            else:
+                # Active or fetch failed — include for tweeting.
+                active_athletes.append(athlete)
+
+        if already_cut:
+            await mark_athletes_removed(db, already_cut)
+
+        return active_athletes
 
     async def _scrape_and_save(
         self,
         db: aiosqlite.Connection,
         ajax_url: str,
         headers: dict[str, str],
-        tweet_new: bool,
         max_retries: int = 3,
-    ) -> tuple[int, set[str], bool]:
-        """Scrape all paginated pages and save new athletes.
+    ) -> tuple[list[Athlete], set[str], bool]:
+        """Scrape all paginated pages, save new athletes, and return them.
 
-        If any page requests fail the entire scrape is retried (up to
-        *max_retries* times) with a freshly captured browser session, so that
-        the seen-URL set is complete before it is used for removal detection.
+        Tweeting is intentionally NOT done here — the caller decides what to
+        tweet after applying any additional filters (e.g. status check).
 
-        Returns (new_count, seen_urls, scrape_complete).
-
-        new_athletes is intentionally declared outside the retry loop so that
-        athletes found new in an early attempt (already saved to DB) are not
-        silently dropped when a retry resets seen_urls — save_athlete uses
-        INSERT OR IGNORE so they would not appear as new a second time.
+        Returns (new_athletes, seen_urls, scrape_complete).
+        new_athletes is accumulated outside the retry loop so athletes already
+        saved in an early attempt aren't lost when seen_urls resets on retry.
         """
-        logger.info(f"=== _scrape_and_save() start — tweet_new={tweet_new} ===")
+        logger.info("=== _scrape_and_save() start ===")
 
-        # Accumulate new athletes across all retry attempts.  seen_urls is
-        # reset per attempt so the final value reflects a single complete pass.
         new_athletes: list[Athlete] = []
         seen_urls: set[str] = set()
         scraper: Scraper | None = None
 
         for attempt in range(1, max_retries + 1):
-            # Reset seen_urls for each attempt to get a fresh complete picture.
             seen_urls = set()
 
             async def on_athlete(athlete: Athlete) -> None:
@@ -302,13 +338,9 @@ class Tracker:
             elapsed = time.monotonic() - t0
 
             if scraper.had_failures and attempt < max_retries:
-                # Some pages were not fetched — the seen-URL set is incomplete
-                # and could produce false removal detections.  Re-capture a
-                # fresh session and retry the full scrape.
                 logger.warning(
                     f"Scrape attempt {attempt}/{max_retries} had request failures "
-                    f"({len(seen_urls)} URLs seen so far, "
-                    f"{len(new_athletes)} new athletes so far) — "
+                    f"({len(seen_urls)} URLs seen, {len(new_athletes)} new so far) — "
                     f"re-capturing session and retrying ..."
                 )
                 try:
@@ -318,14 +350,12 @@ class Tracker:
                         f"Session re-capture for retry {attempt + 1} failed: {e}",
                         exc_info=True,
                     )
-                    # Keep existing ajax_url/headers and try again anyway.
                 continue
 
             if scraper.had_failures:
                 logger.warning(
                     f"Scrape still had failures after {max_retries} attempt(s) — "
-                    f"proceeding with partial data; confirmation scrape will guard "
-                    f"against false removal detections."
+                    f"proceeding with partial data."
                 )
             else:
                 logger.info(
@@ -335,80 +365,59 @@ class Tracker:
             break
 
         scrape_complete = scraper is not None and not scraper.had_failures
-
-        if tweet_new and self._poster and new_athletes:
-            logger.info(f"Tweeting {len(new_athletes)} new athlete(s) ...")
-            for i, athlete in enumerate(new_athletes, 1):
-                logger.info(f"Tweeting {i}/{len(new_athletes)}: {athlete.name}")
-                await self._tweet_athlete(athlete)
-            if not self._test_mode:
-                await self._close_poster()
-        elif new_athletes and not tweet_new:
-            logger.info(
-                f"{len(new_athletes)} new athlete(s) saved — "
-                f"tweeting suppressed (first run)."
-            )
-
-        return len(new_athletes), seen_urls, scrape_complete
+        return new_athletes, seen_urls, scrape_complete
 
     async def _save_initial_batch(
         self,
         db: aiosqlite.Connection,
         initial_athletes: list[Athlete],
-    ) -> tuple[list[Athlete], set[str]]:
+    ) -> list[Athlete]:
+        """Save the initial DOM batch; returns new (unseen) athletes."""
         new: list[Athlete] = []
-        seen_urls: set[str] = set()
         for athlete in initial_athletes:
-            if athlete.profile_url:
-                seen_urls.add(athlete.profile_url)
             if await save_athlete(db, athlete):
                 new.append(athlete)
         logger.info(
             f"Initial DOM batch: {len(new)}/{len(initial_athletes)} new athlete(s)."
         )
-        return new, seen_urls
+        return new
 
     async def _poll(
         self,
         db: aiosqlite.Connection,
-        ajax_url: str,
-        headers: dict[str, str],
     ) -> None:
-        logger.info("=== _poll() start — re-capturing browser session ===")
+        """Single poll cycle: re-capture session, scrape, detect status changes."""
+        logger.info("=== _poll() start ===")
         t0 = time.monotonic()
 
         initial_athletes, ajax_url, headers = await self._browser.capture_session()
-        new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
+        new_initial = await self._save_initial_batch(db, initial_athletes)
 
-        new_count, seen_scraped, scrape_complete = await self._scrape_and_save(
-            db, ajax_url, headers, tweet_new=True
-        )
-        seen_all = seen_initial | seen_scraped
+        new_scraped, _, _ = await self._scrape_and_save(db, ajax_url, headers)
 
-        # Always run removal detection.  Any athletes missed in the first scrape
-        # due to transient page failures will be found in the confirmation scrape
-        # inside _detect_and_handle_removed and filtered out as false positives.
-        if not scrape_complete:
-            logger.warning(
-                "First scrape had failures — proceeding with removal detection; "
-                "the confirmation scrape will filter out false positives."
-            )
-        removed_count = await self._detect_and_handle_removed(db, seen_all, tweet=True)
+        # Combine all new athletes found this cycle, then verify their live
+        # status before tweeting — avoids 'Fighter Added' for someone already cut.
+        all_new = new_initial + new_scraped
+        if all_new:
+            tweetable_new = await self._filter_active_new_athletes(db, all_new)
+            if tweetable_new and self._poster:
+                logger.info(f"Tweeting {len(tweetable_new)} new active athlete(s) ...")
+                for i, athlete in enumerate(tweetable_new, 1):
+                    logger.info(f"Tweeting new {i}/{len(tweetable_new)}: {athlete.name}")
+                    await self._tweet_athlete(athlete)
+        else:
+            tweetable_new = []
 
-        total_new = new_count + len(new_initial)
+        # Status-based removal: primary mechanism for detecting roster cuts.
+        removed_count = await self._detect_status_changes(db, tweet=True)
+
         elapsed = time.monotonic() - t0
         logger.info(
-            f"=== _poll() complete — {total_new} new, {removed_count} removed "
+            f"=== _poll() complete — {len(tweetable_new)} new, {removed_count} removed "
             f"in {elapsed:.1f}s ==="
         )
 
-        if self._poster and new_initial:
-            logger.info(f"Tweeting {len(new_initial)} from initial DOM batch ...")
-            for i, athlete in enumerate(new_initial, 1):
-                logger.info(f"Tweeting initial {i}/{len(new_initial)}: {athlete.name}")
-                await self._tweet_athlete(athlete)
-
-        if self._poster and (new_initial or removed_count) and not self._test_mode:
+        if self._poster and (tweetable_new or removed_count) and not self._test_mode:
             await self._close_poster()
 
         if self._test_mode and self._poster:
@@ -425,44 +434,43 @@ class Tracker:
             is_first_run = count == 0
 
             if is_first_run:
-                logger.info("First run — caching all athletes without posting tweets.")
+                logger.info("First run — caching all athletes, no tweets this cycle.")
             else:
-                logger.info(f"DB has {count} athletes — polling for new ones.")
+                logger.info(f"DB has {count} active athletes — checking for changes.")
 
             logger.info("--- Phase 1: Capture browser session ---")
             initial_athletes, ajax_url, headers = await self._browser.capture_session()
-
-            new_initial, seen_initial = await self._save_initial_batch(db, initial_athletes)
+            new_initial = await self._save_initial_batch(db, initial_athletes)
 
             logger.info("--- Phase 2: Full scrape ---")
-            _, seen_scraped, scrape_complete = await self._scrape_and_save(
-                db, ajax_url, headers, tweet_new=not is_first_run
-            )
-            seen_all = seen_initial | seen_scraped
-
-            if not is_first_run:
-                # Always run removal detection regardless of scrape_complete.
-                # The confirmation scrape inside _detect_and_handle_removed is
-                # the safety net that filters out false positives from missed pages.
-                if not scrape_complete:
-                    logger.warning(
-                        "First scrape had failures — proceeding with removal detection; "
-                        "the confirmation scrape will filter out false positives."
-                    )
-                await self._detect_and_handle_removed(db, seen_all, tweet=True)
-
-                if self._poster and new_initial:
-                    logger.info(
-                        f"Tweeting {len(new_initial)} new athlete(s) from initial DOM batch ..."
-                    )
-                    for athlete in new_initial:
-                        await self._tweet_athlete(athlete)
+            new_scraped, _, _ = await self._scrape_and_save(db, ajax_url, headers)
 
             if is_first_run:
                 logger.info("Initial cache complete.")
+                # Silently baseline all 'Not Fighting' fighters so the very first
+                # polling cycle only tweets genuine new status changes.
+                logger.info("First run — running silent status check to baseline DB ...")
+                await self._detect_status_changes(db, tweet=False)
+            else:
+                # Not a fresh DB — check new athletes' status before tweeting,
+                # then detect status changes for existing active athletes.
+                all_new = new_initial + new_scraped
+                if all_new:
+                    tweetable_new = await self._filter_active_new_athletes(db, all_new)
+                    if tweetable_new and self._poster:
+                        logger.info(
+                            f"Tweeting {len(tweetable_new)} new active athlete(s) ..."
+                        )
+                        for athlete in tweetable_new:
+                            await self._tweet_athlete(athlete)
+
+                await self._detect_status_changes(db, tweet=True)
+
+                if self._poster and not self._test_mode:
+                    await self._close_poster()
 
             if self._test_mode and self._poster:
-                logger.info("TEST_MODE active — posting test tweet after initial run ...")
+                logger.info("TEST_MODE active — posting test tweet ...")
                 await self._post_test_tweet(db)
                 await self._close_poster()
 
@@ -477,9 +485,7 @@ class Tracker:
                 poll_count += 1
                 logger.info(f"--- Poll #{poll_count} start ---")
                 try:
-                    await self._poll(db, ajax_url, headers)
+                    await self._poll(db)
                 except Exception as e:
-                    logger.error(
-                        f"Poll #{poll_count} failed: {e}", exc_info=True
-                    )
+                    logger.error(f"Poll #{poll_count} failed: {e}", exc_info=True)
                     logger.info("Will retry on next poll interval.")
