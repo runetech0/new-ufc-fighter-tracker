@@ -19,7 +19,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
             record         TEXT,
             image_url      TEXT,
             is_active      INTEGER NOT NULL DEFAULT 1,
-            fighter_status TEXT NOT NULL DEFAULT 'Active'
+            fighter_status TEXT NOT NULL DEFAULT 'active'
         )
     """)
     await db.commit()
@@ -27,7 +27,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
     for col, definition in [
         ("image_url", "TEXT"),
         ("is_active", "INTEGER NOT NULL DEFAULT 1"),
-        ("fighter_status", "TEXT NOT NULL DEFAULT 'Active'"),
+        ("fighter_status", "TEXT NOT NULL DEFAULT 'active'"),
     ]:
         try:
             await db.execute(f"ALTER TABLE athletes ADD COLUMN {col} {definition}")
@@ -35,6 +35,18 @@ async def init_db(db: aiosqlite.Connection) -> None:
             logger.info(f"DB migration: added '{col}' column.")
         except Exception:
             pass  # column already exists
+
+    # Normalise any mixed-case fighter_status values left over from older code
+    # versions that stored 'Active', 'Not Fighting', 'Retired' with capitals.
+    result = await db.execute(
+        "UPDATE athletes SET fighter_status = LOWER(fighter_status) "
+        "WHERE fighter_status != LOWER(fighter_status)"
+    )
+    await db.commit()
+    if result.rowcount:
+        logger.info(
+            f"DB migration: lowercased {result.rowcount} fighter_status value(s)."
+        )
 
 
 async def get_athlete_count(db: aiosqlite.Connection) -> int:
@@ -132,7 +144,7 @@ async def mark_athletes_removed(
                 image_url=row[5],
             ))
         await db.execute(
-            "UPDATE athletes SET is_active = 0, fighter_status = 'Not Fighting' "
+            "UPDATE athletes SET is_active = 0, fighter_status = 'not fighting' "
             "WHERE profile_url = ?",
             (url,),
         )
@@ -165,7 +177,7 @@ async def save_athlete(db: aiosqlite.Connection, athlete: Athlete) -> bool:
         # Reactivate if previously removed; also reset fighter_status so the
         # next status-check cycle re-evaluates their profile page from scratch.
         reactivate = await db.execute(
-            "UPDATE athletes SET is_active = 1, fighter_status = 'Active' "
+            "UPDATE athletes SET is_active = 1, fighter_status = 'active' "
             "WHERE profile_url = ? AND is_active = 0",
             (athlete.profile_url,),
         )

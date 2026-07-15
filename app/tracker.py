@@ -24,7 +24,7 @@ from .db import (
 from .models import Athlete
 from .poster import TweetPoster
 from .scraper import Scraper
-from .status_checker import STATUS_ACTIVE, STATUS_NOT_FIGHTING, fetch_statuses
+from .status_checker import INACTIVE_STATUSES, STATUS_ACTIVE, fetch_statuses
 
 logger = get_logger()
 
@@ -219,7 +219,8 @@ class Tracker:
         newly_removed: set[str] = set()
 
         for url, live_status in live_statuses.items():
-            db_status = db_statuses.get(url, STATUS_ACTIVE)
+            # Always compare lowercase — guards against stale mixed-case DB values.
+            db_status = db_statuses.get(url, STATUS_ACTIVE).lower()
 
             if live_status == db_status:
                 continue
@@ -228,7 +229,7 @@ class Tracker:
                 f"Status changed: {url} — DB='{db_status}' → live='{live_status}'"
             )
 
-            if live_status == STATUS_NOT_FIGHTING and db_status == STATUS_ACTIVE:
+            if live_status in INACTIVE_STATUSES and db_status == STATUS_ACTIVE:
                 newly_removed.add(url)
             else:
                 # Any other transition: just persist the new value.
@@ -283,7 +284,7 @@ class Tracker:
 
         for athlete in new_athletes:
             live = live_statuses.get(athlete.profile_url) if athlete.profile_url else None
-            if live == STATUS_NOT_FIGHTING:
+            if live in INACTIVE_STATUSES:
                 logger.info(
                     f"New athlete {athlete.name} is already 'Not Fighting' — "
                     f"saving silently, no tweet."

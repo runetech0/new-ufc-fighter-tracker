@@ -15,8 +15,17 @@ from app.logs_config import get_logger
 logger = get_logger()
 
 STATUS_SELECTOR = "p.hero-profile__tag"
-STATUS_ACTIVE = "Active"
-STATUS_NOT_FIGHTING = "Not Fighting"
+STATUS_ACTIVE = "active"
+STATUS_NOT_FIGHTING = "not fighting"
+STATUS_RETIRED = "retired"
+
+# Statuses that mean the fighter is no longer under active UFC contract.
+INACTIVE_STATUSES = {STATUS_NOT_FIGHTING, STATUS_RETIRED}
+
+# All known status values.  Any p.hero-profile__tag whose text is NOT in this
+# set is a supplementary label (e.g. "Hall of Fame", "Title Holder") and is
+# ignored when looking for the fighter's activity status.
+KNOWN_STATUSES = {STATUS_ACTIVE, STATUS_NOT_FIGHTING, STATUS_RETIRED}
 
 _HEADERS = {
     "User-Agent": (
@@ -32,15 +41,23 @@ async def _fetch_status(
     profile_url: str,
     semaphore: asyncio.Semaphore,
 ) -> tuple[str, str | None]:
-    """Return (profile_url, status_text | None).  None means the request failed."""
+    """Return (profile_url, status_text | None).  None means the request failed.
+
+    Scans all p.hero-profile__tag elements and returns the first whose text
+    matches a known status value (Active / Not Fighting / Retired).  Extra
+    labels such as 'Hall of Fame' or 'Title Holder' are ignored.
+    """
     async with semaphore:
         try:
             r = await client.get(profile_url)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
-            el = soup.select_one(STATUS_SELECTOR)
-            status = el.get_text(strip=True) if el else None
-            return profile_url, status
+            for el in soup.select(STATUS_SELECTOR):
+                text = el.get_text(strip=True).lower()
+                if text in KNOWN_STATUSES:
+                    return profile_url, text
+            # No recognisable status tag found — treat as unknown (None).
+            return profile_url, None
         except Exception as exc:
             logger.debug(f"Status check failed for {profile_url}: {exc}")
             return profile_url, None
