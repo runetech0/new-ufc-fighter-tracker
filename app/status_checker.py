@@ -61,15 +61,24 @@ async def _fetch_status(
                 text = el.get_text(strip=True).lower()
                 if text in KNOWN_STATUSES:
                     return profile_url, text, None
-            # Page loaded fine but no recognised status tag found.
-            return profile_url, None, _FAIL_NO_STATUS
+            # Page loaded fine but no recognised status tag found — capture
+            # diagnostic info so we can see what the server actually returned.
+            title = soup.title.get_text(strip=True) if soup.title else "no <title>"
+            all_tags = [el.get_text(strip=True) for el in soup.select(STATUS_SELECTOR)]
+            body_snippet = r.text[:300].replace("\n", " ")
+            diag = (
+                f"title='{title}' | "
+                f"p.hero-profile__tag found={all_tags} | "
+                f"body[:300]={body_snippet!r}"
+            )
+            return profile_url, None, f"{_FAIL_NO_STATUS}: {diag}"
         except Exception as exc:
             return profile_url, None, f"{_FAIL_HTTP}: {exc}"
 
 
 async def fetch_statuses(
     profile_urls: set[str],
-    concurrency: int = 20,
+    concurrency: int = 5,
     timeout: int = 15,
 ) -> tuple[dict[str, str], bool]:
     """Fetch all fighter profiles concurrently and return their live statuses.
@@ -106,6 +115,7 @@ async def fetch_statuses(
         ]
         results = await asyncio.gather(*tasks)
 
+    no_status_samples: list[str] = []
     for url, status, reason in results:
         if status is not None:
             statuses[url] = status
@@ -113,12 +123,13 @@ async def fetch_statuses(
             http_errors.append(f"{url} — {reason}")
         else:
             no_status_count += 1
+            if len(no_status_samples) < 3 and reason:
+                no_status_samples.append(f"  {url}\n    {reason}")
 
     failure_count = len(http_errors) + no_status_count
     had_failures = failure_count > 0
 
     if http_errors:
-        # Log the first 5 HTTP errors at WARNING so the cause is visible.
         sample = http_errors[:5]
         logger.warning(
             f"Status check — {len(http_errors)} HTTP/network error(s). "
@@ -126,10 +137,12 @@ async def fetch_statuses(
         )
 
     if no_status_count:
+        sample_txt = "\n".join(no_status_samples) if no_status_samples else ""
         logger.warning(
             f"Status check — {no_status_count} profile(s) loaded OK but had "
             f"no recognisable status tag (selector='{STATUS_SELECTOR}', "
             f"known={sorted(KNOWN_STATUSES)})."
+            + (f"\nSample diagnostics:\n{sample_txt}" if sample_txt else "")
         )
 
     logger.info(
