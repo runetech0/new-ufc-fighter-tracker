@@ -27,6 +27,34 @@ INACTIVE_STATUSES = {STATUS_NOT_FIGHTING, STATUS_RETIRED}
 # ignored when looking for the fighter's activity status.
 KNOWN_STATUSES = {STATUS_ACTIVE, STATUS_NOT_FIGHTING, STATUS_RETIRED}
 
+# Multi-language aliases → canonical English status.
+# UFC pages are geo-IP localised; the server may ignore Accept-Language headers.
+_STATUS_MAP: dict[str, str] = {
+    # English
+    "active": STATUS_ACTIVE,
+    "not fighting": STATUS_NOT_FIGHTING,
+    "retired": STATUS_RETIRED,
+    # French
+    "actif": STATUS_ACTIVE,
+    "active": STATUS_ACTIVE,        # French feminine (identical spelling)
+    "ne se bat pas": STATUS_NOT_FIGHTING,
+    "retraité": STATUS_RETIRED,
+    "retraitée": STATUS_RETIRED,
+    "à la retraite": STATUS_RETIRED,
+    # Spanish (UFC.com also localises to Spanish)
+    "activo": STATUS_ACTIVE,
+    "activa": STATUS_ACTIVE,
+    "no está peleando": STATUS_NOT_FIGHTING,
+    "retirado": STATUS_RETIRED,
+    "retirada": STATUS_RETIRED,
+    # Portuguese
+    "ativo": STATUS_ACTIVE,
+    "ativa": STATUS_ACTIVE,
+    "não está lutando": STATUS_NOT_FIGHTING,
+    "aposentado": STATUS_RETIRED,
+    "aposentada": STATUS_RETIRED,
+}
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
@@ -60,10 +88,10 @@ async def _fetch_status(
             soup = BeautifulSoup(r.text, "html.parser")
             for el in soup.select(STATUS_SELECTOR):
                 text = el.get_text(strip=True).lower()
-                if text in KNOWN_STATUSES:
-                    return profile_url, text, None
-            # Page loaded fine but no recognised status tag found — capture
-            # diagnostic info so we can see what the server actually returned.
+                canonical = _STATUS_MAP.get(text)
+                if canonical:
+                    return profile_url, canonical, None
+            # Page loaded fine but no recognised status tag — capture diagnostics.
             title = soup.title.get_text(strip=True) if soup.title else "no <title>"
             all_tags = [el.get_text(strip=True) for el in soup.select(STATUS_SELECTOR)]
             body_snippet = r.text[:300].replace("\n", " ")
