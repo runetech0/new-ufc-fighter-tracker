@@ -228,24 +228,36 @@ class Tracker:
             if live_status == db_status:
                 continue
 
-            logger.info(
-                f"Status changed: {url} — DB='{db_status}' → live='{live_status}'"
-            )
+            if tweet:
+                logger.info(
+                    f"Status changed: {url} — DB='{db_status}' → live='{live_status}'"
+                )
+            else:
+                logger.debug(
+                    f"Baseline: {url} — DB='{db_status}' → live='{live_status}'"
+                )
 
             if live_status in INACTIVE_STATUSES and db_status == STATUS_ACTIVE:
                 newly_removed.add(url)
             else:
-                # Any other transition: just persist the new value.
                 await update_fighter_status(db, url, live_status)
 
         if not newly_removed:
-            logger.info("Status change detection — no newly released fighters detected.")
+            if tweet:
+                logger.info("Status change detection — no newly released fighters detected.")
             return 0, rebaselined
 
-        logger.info(
-            f"{len(newly_removed)} fighter(s) newly changed to 'Not Fighting' — "
-            f"marking as removed ..."
-        )
+        if tweet:
+            logger.info(
+                f"{len(newly_removed)} fighter(s) newly changed to inactive — "
+                f"marking as removed ..."
+            )
+        else:
+            logger.info(
+                f"First-run baseline: silently marking {len(newly_removed)} "
+                f"already-inactive fighter(s) in DB (no tweets)."
+            )
+
         removed_athletes = await mark_athletes_removed(db, newly_removed)
 
         if tweet and self._poster and removed_athletes:
