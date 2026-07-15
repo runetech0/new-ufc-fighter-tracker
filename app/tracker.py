@@ -16,6 +16,7 @@ from .db import (
     get_athlete_count,
     get_random_athlete,
     get_random_removed_athlete,
+    get_status_counts,
     init_db,
     mark_athletes_removed,
     save_athlete,
@@ -182,7 +183,8 @@ class Tracker:
         self,
         db: aiosqlite.Connection,
         tweet: bool,
-    ) -> int:
+    ) -> tuple[int, int]:
+        """Return (removed_count, rebaselined_count)."""
         """Detect UFC roster changes by comparing live profile-page status against DB.
 
         Flow:
@@ -200,7 +202,7 @@ class Tracker:
         db_statuses: dict[str, str] = await get_active_statuses(db)
         if not db_statuses:
             logger.info("Status change detection — no active athletes in DB.")
-            return 0
+            return 0, 0
 
         logger.info(
             f"Status change detection — {len(db_statuses)} active athlete(s) in DB, "
@@ -217,6 +219,7 @@ class Tracker:
             )
 
         newly_removed: set[str] = set()
+        rebaselined = 0
 
         for url, live_status in live_statuses.items():
             # Always compare lowercase — guards against stale mixed-case DB values.
@@ -237,7 +240,7 @@ class Tracker:
 
         if not newly_removed:
             logger.info("Status change detection — no newly released fighters detected.")
-            return 0
+            return 0, rebaselined
 
         logger.info(
             f"{len(newly_removed)} fighter(s) newly changed to 'Not Fighting' — "
@@ -255,7 +258,7 @@ class Tracker:
                 )
                 await self._tweet_athlete(athlete, removed=True)
 
-        return len(removed_athletes)
+        return len(removed_athletes), rebaselined
 
     async def _filter_active_new_athletes(
         self,
@@ -410,12 +413,28 @@ class Tracker:
             tweetable_new = []
 
         # Status-based removal: primary mechanism for detecting roster cuts.
-        removed_count = await self._detect_status_changes(db, tweet=True)
+        removed_count, rebaselined_count = await self._detect_status_changes(db, tweet=True)
 
         elapsed = time.monotonic() - t0
+        status_counts = await get_status_counts(db)
+
+        active_n      = status_counts.get("active", 0)
+        not_fighting_n = status_counts.get("not fighting", 0)
+        retired_n     = status_counts.get("retired", 0)
+        unset_n       = status_counts.get("unset", 0)
+        total_n       = sum(status_counts.values())
+
         logger.info(
-            f"=== _poll() complete — {len(tweetable_new)} new, {removed_count} removed "
-            f"in {elapsed:.1f}s ==="
+            f"\n"
+            f"{'='*55}\n"
+            f"  Poll cycle summary  ({elapsed:.1f}s)\n"
+            f"{'='*55}\n"
+            f"  DB totals  : {total_n} athletes\n"
+            f"               active={active_n} | not fighting={not_fighting_n} "
+            f"| retired={retired_n} | unset={unset_n}\n"
+            f"  This cycle : {len(all_new)} found | {len(tweetable_new)} new tweeted "
+            f"| {removed_count} removed tweeted | {rebaselined_count} re-baselined\n"
+            f"{'='*55}"
         )
 
         if self._poster and (tweetable_new or removed_count) and not self._test_mode:
@@ -456,6 +475,7 @@ class Tracker:
                 # Not a fresh DB — check new athletes' status before tweeting,
                 # then detect status changes for existing active athletes.
                 all_new = new_initial + new_scraped
+                tweetable_new: list[Athlete] = []
                 if all_new:
                     tweetable_new = await self._filter_active_new_athletes(db, all_new)
                     if tweetable_new and self._poster:
@@ -465,7 +485,25 @@ class Tracker:
                         for athlete in tweetable_new:
                             await self._tweet_athlete(athlete)
 
-                await self._detect_status_changes(db, tweet=True)
+                removed_count, rebaselined_count = await self._detect_status_changes(db, tweet=True)
+                status_counts = await get_status_counts(db)
+                active_n       = status_counts.get("active", 0)
+                not_fighting_n = status_counts.get("not fighting", 0)
+                retired_n      = status_counts.get("retired", 0)
+                unset_n        = status_counts.get("unset", 0)
+                total_n        = sum(status_counts.values())
+                logger.info(
+                    f"\n"
+                    f"{'='*55}\n"
+                    f"  Initial run summary\n"
+                    f"{'='*55}\n"
+                    f"  DB totals  : {total_n} athletes\n"
+                    f"               active={active_n} | not fighting={not_fighting_n} "
+                    f"| retired={retired_n} | unset={unset_n}\n"
+                    f"  This cycle : {len(all_new)} found | {len(tweetable_new)} new tweeted "
+                    f"| {removed_count} removed tweeted | {rebaselined_count} re-baselined\n"
+                    f"{'='*55}"
+                )
 
                 if self._poster and not self._test_mode:
                     await self._close_poster()

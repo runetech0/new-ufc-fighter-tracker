@@ -24,30 +24,6 @@ async def init_db(db: aiosqlite.Connection) -> None:
     """)
     await db.commit()
 
-    for col, definition in [
-        ("image_url", "TEXT"),
-        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
-        ("fighter_status", "TEXT NOT NULL DEFAULT 'active'"),
-    ]:
-        try:
-            await db.execute(f"ALTER TABLE athletes ADD COLUMN {col} {definition}")
-            await db.commit()
-            logger.info(f"DB migration: added '{col}' column.")
-        except Exception:
-            pass  # column already exists
-
-    # Normalise any mixed-case fighter_status values left over from older code
-    # versions that stored 'Active', 'Not Fighting', 'Retired' with capitals.
-    result = await db.execute(
-        "UPDATE athletes SET fighter_status = LOWER(fighter_status) "
-        "WHERE fighter_status != LOWER(fighter_status)"
-    )
-    await db.commit()
-    if result.rowcount:
-        logger.info(
-            f"DB migration: lowercased {result.rowcount} fighter_status value(s)."
-        )
-
 
 async def get_athlete_count(db: aiosqlite.Connection) -> int:
     async with db.execute(
@@ -91,6 +67,17 @@ async def get_random_removed_athlete(db: aiosqlite.Connection) -> Athlete | None
             record=row[4],
             image_url=row[5],
         )
+
+
+async def get_status_counts(db: aiosqlite.Connection) -> dict[str, int]:
+    """Return a count of athletes grouped by fighter_status for all rows."""
+    counts: dict[str, int] = {}
+    async with db.execute(
+        "SELECT fighter_status, COUNT(*) FROM athletes GROUP BY fighter_status"
+    ) as cursor:
+        async for row in cursor:
+            counts[row[0]] = row[1]
+    return counts
 
 
 async def get_active_statuses(db: aiosqlite.Connection) -> dict[str, str]:
