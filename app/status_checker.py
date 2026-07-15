@@ -35,14 +35,19 @@ _HEADERS = {
     )
 }
 
+# Two failure categories to distinguish HTTP/network errors from parse misses.
+_FAIL_HTTP = "http_error"
+_FAIL_NO_STATUS = "no_status_tag"
+
 
 async def _fetch_status(
     client: httpx.AsyncClient,
     profile_url: str,
     semaphore: asyncio.Semaphore,
-) -> tuple[str, str | None]:
-    """Return (profile_url, status_text | None).  None means the request failed.
+) -> tuple[str, str | None, str | None]:
+    """Return (profile_url, status_text | None, failure_reason | None).
 
+    failure_reason is one of _FAIL_HTTP, _FAIL_NO_STATUS, or None (success).
     Scans all p.hero-profile__tag elements and returns the first whose text
     matches a known status value (Active / Not Fighting / Retired).  Extra
     labels such as 'Hall of Fame' or 'Title Holder' are ignored.
@@ -55,12 +60,11 @@ async def _fetch_status(
             for el in soup.select(STATUS_SELECTOR):
                 text = el.get_text(strip=True).lower()
                 if text in KNOWN_STATUSES:
-                    return profile_url, text
-            # No recognisable status tag found — treat as unknown (None).
-            return profile_url, None
+                    return profile_url, text, None
+            # Page loaded fine but no recognised status tag found.
+            return profile_url, None, _FAIL_NO_STATUS
         except Exception as exc:
-            logger.debug(f"Status check failed for {profile_url}: {exc}")
-            return profile_url, None
+            return profile_url, None, f"{_FAIL_HTTP}: {exc}"
 
 
 async def fetch_statuses(
@@ -88,7 +92,8 @@ async def fetch_statuses(
 
     semaphore = asyncio.Semaphore(concurrency)
     statuses: dict[str, str] = {}
-    failure_count = 0
+    http_errors: list[str] = []
+    no_status_count = 0
 
     async with httpx.AsyncClient(
         timeout=timeout,
@@ -101,19 +106,34 @@ async def fetch_statuses(
         ]
         results = await asyncio.gather(*tasks)
 
-    for url, status in results:
-        if status is None:
-            failure_count += 1
-        else:
+    for url, status, reason in results:
+        if status is not None:
             statuses[url] = status
+        elif reason and reason.startswith(_FAIL_HTTP):
+            http_errors.append(f"{url} — {reason}")
+        else:
+            no_status_count += 1
 
+    failure_count = len(http_errors) + no_status_count
     had_failures = failure_count > 0
-    if had_failures:
+
+    if http_errors:
+        # Log the first 5 HTTP errors at WARNING so the cause is visible.
+        sample = http_errors[:5]
         logger.warning(
-            f"Status check — {failure_count}/{len(profile_urls)} profile fetch(es) failed "
-            f"(those fighters are excluded from comparison this cycle)."
+            f"Status check — {len(http_errors)} HTTP/network error(s). "
+            f"First {len(sample)}:\n" + "\n".join(f"  {e}" for e in sample)
         )
+
+    if no_status_count:
+        logger.warning(
+            f"Status check — {no_status_count} profile(s) loaded OK but had "
+            f"no recognisable status tag (selector='{STATUS_SELECTOR}', "
+            f"known={sorted(KNOWN_STATUSES)})."
+        )
+
     logger.info(
-        f"Status check complete — {len(statuses)} fetched, {failure_count} failures."
+        f"Status check complete — {len(statuses)} fetched successfully, "
+        f"{len(http_errors)} HTTP errors, {no_status_count} missing status tag."
     )
     return statuses, had_failures
